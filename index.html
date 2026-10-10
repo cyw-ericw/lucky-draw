@@ -134,45 +134,109 @@ function tone(freq,duration,vol,delay=0,type='sine'){
     oscillator.onended=()=>{activeTones.delete(oscillator);oscillator.disconnect();gain.disconnect()};
     oscillator.start(start);oscillator.stop(start+duration+.01);
 }
-// A soft rolling bed plus brief contacts, driven by the visible ball simulation.
+// Rolling audio only: a textured friction bed and short, damped plastic/glass contacts.
+// All voices feed the existing audioMaster. Existing draw/reveal tones are untouched.
 let rollingVoice=null,rollingNoise=null,lastBallContact=-1;
+let rollingNoiseContext=null,contactBuffers=[],contactBufferContext=null;
 function noiseBuffer(){
-    if(rollingNoise&&rollingNoise.sampleRate===audioCtx.sampleRate)return rollingNoise;
-    rollingNoise=audioCtx.createBuffer(1,audioCtx.sampleRate,audioCtx.sampleRate);
-    const data=rollingNoise.getChannelData(0);let smooth=0;
-    for(let i=0;i<data.length;i++){const white=Math.random()*2-1;smooth=.8*smooth+.2*white;data[i]=white*.4+smooth*.6}
+    if(rollingNoise&&rollingNoiseContext===audioCtx)return rollingNoise;
+    rollingNoiseContext=audioCtx;
+    const rate=audioCtx.sampleRate;
+    rollingNoise=audioCtx.createBuffer(1,rate*4,rate);
+    const data=rollingNoise.getChannelData(0);
+    let low=0,grit=0,envelope=.5,target=.5,next=0;
+    for(let i=0;i<data.length;i++){
+        if(i>=next){target=.25+Math.random()*.75;next=i+rate*(.015+Math.random()*.065)}
+        const white=Math.random()*2-1;
+        low=.965*low+.035*white;grit=.62*grit+.38*white;
+        envelope+=(target-envelope)*.004;
+        // Irregular rubbing texture rather than a periodically modulated hiss.
+        data[i]=(low*1.8+grit*.65+white*.08)*envelope;
+    }
     return rollingNoise;
 }
-function updateRollingSound(intensity){
-    if(!soundOn||!audioCtx||audioCtx.state!=='running'||intensity<.025){if(rollingVoice)rollingVoice.gain.gain.setTargetAtTime(0,audioCtx.currentTime,.035);return}
-    if(!rollingVoice){
-        const source=audioCtx.createBufferSource(),filter=audioCtx.createBiquadFilter(),gain=audioCtx.createGain();
-        source.buffer=noiseBuffer();source.loop=true;filter.type='bandpass';filter.Q.value=.7;gain.gain.value=0;
-        source.connect(filter);filter.connect(gain);gain.connect(audioMaster);source.start();
-        rollingVoice={source,filter,gain};
-        source.onended=()=>{source.disconnect();filter.disconnect();gain.disconnect()};
+function makeContactBuffers(){
+    if(contactBufferContext===audioCtx&&contactBuffers.length)return contactBuffers;
+    contactBufferContext=audioCtx;contactBuffers=[];
+    const rate=audioCtx.sampleRate;
+    for(let k=0;k<12;k++){
+        const duration=.06+Math.random()*.03;
+        const buffer=audioCtx.createBuffer(1,Math.ceil(rate*duration),rate);
+        const data=buffer.getChannelData(0),body=360+Math.random()*450;
+        const resonance=body*(1.75+Math.random()*.6),decay=.007+Math.random()*.009;
+        let smooth=0;
+        for(let i=0;i<data.length;i++){
+            const t=i/rate,white=Math.random()*2-1;
+            smooth=.48*smooth+.52*white;
+            const tap=smooth*Math.exp(-t/.005)*.8;
+            const shell=(Math.sin(2*Math.PI*body*t)*.38+Math.sin(2*Math.PI*resonance*t+.4)*.22)*Math.exp(-t/decay);
+            const rub=smooth*Math.exp(-t/.021)*.18;
+            const attack=Math.min(1,t/.0008),tail=Math.min(1,(duration-t)/.008);
+            data[i]=(tap+shell+rub)*attack*Math.max(0,tail);
+        }
+        contactBuffers.push(buffer);
     }
-    const now=audioCtx.currentTime,strength=Math.min(1,intensity);
-    rollingVoice.filter.frequency.setTargetAtTime(500+strength*950,now,.045);
-    rollingVoice.gain.gain.setTargetAtTime((.04+.14*strength)*(.85+.15*Math.sin(now*31)),now,.025);
+    return contactBuffers;
+}
+function updateRollingSound(intensity){
+    if(!soundOn||!audioCtx||audioCtx.state!=='running'||!audioMaster){stopRollingSound();return}
+    const strength=Math.max(0,Math.min(1,intensity));
+    if(!rollingVoice&&strength<=.001)return;
+    if(!rollingVoice){
+        const source=audioCtx.createBufferSource(),filter=audioCtx.createBiquadFilter();
+        const gain=audioCtx.createGain(),bus=audioCtx.createGain(),compressor=audioCtx.createDynamicsCompressor();
+        source.buffer=noiseBuffer();source.loop=true;
+        filter.type='bandpass';filter.Q.value=.55;
+        gain.gain.value=0;bus.gain.value=.8;
+        compressor.threshold.value=-20;compressor.knee.value=16;compressor.ratio.value=3;
+        compressor.attack.value=.003;compressor.release.value=.075;
+        source.connect(filter);filter.connect(gain);gain.connect(compressor);
+        compressor.connect(bus);bus.connect(audioMaster);
+        const voice={source,filter,gain,bus,compressor,impacts:new Set(),strength:0,nextContact:audioCtx.currentTime,nextTexture:0,texture:.8};
+        rollingVoice=voice;lastBallContact=-1;
+        source.onended=()=>{source.disconnect();filter.disconnect();gain.disconnect();compressor.disconnect();bus.disconnect()};
+        source.start();
+    }
+    const v=rollingVoice,now=audioCtx.currentTime;v.strength=strength;
+    if(now>=v.nextTexture){v.texture=.7+Math.random()*.5;v.nextTexture=now+.06+Math.random()*.14}
+    v.filter.frequency.setTargetAtTime(480+strength*650,now,.045);
+    v.source.playbackRate.setTargetAtTime(.68+strength*.58,now,.055);
+    v.gain.gain.setTargetAtTime((.015+.22*Math.pow(strength,.9))*v.texture,now,.025);
+    // A shared, irregular contact cadence also represents contacts hidden behind other balls.
+    // Actual visible collisions below use the same limiter, so they cannot double the rate.
+    if(strength>.025&&now>=v.nextContact)ballContactSound(2+strength*9,true);
 }
 function stopRollingSound(){
-    if(!rollingVoice)return;const voice=rollingVoice;rollingVoice=null;
-    voice.gain.gain.cancelScheduledValues(audioCtx.currentTime);
-    voice.gain.gain.setTargetAtTime(0,audioCtx.currentTime,.012);
-    try{voice.source.stop(audioCtx.currentTime+.06)}catch(e){}
+    const voice=rollingVoice;if(!voice)return;
+    rollingVoice=null;lastBallContact=-1;
+    const now=audioCtx.currentTime;
+    voice.bus.gain.cancelScheduledValues(now);
+    voice.bus.gain.setValueAtTime(voice.bus.gain.value,now);
+    voice.bus.gain.linearRampToValueAtTime(0,now+.012);
+    for(const source of voice.impacts){try{source.stop(now+.015)}catch(e){}}
+    try{voice.source.stop(now+.018)}catch(e){}
 }
 function ballContactSound(speed,preview=false){
-    if(!soundOn||!audioCtx||audioCtx.state!=='running'||speed<1.3)return;
-    if(!preview&&(!busy||activeTab!=='prize'||orbMotion<.05))return;
-    const now=audioCtx.currentTime;if(now-lastBallContact<.035)return;lastBallContact=now;
-    const source=audioCtx.createBufferSource(),filter=audioCtx.createBiquadFilter(),gain=audioCtx.createGain();
-    source.buffer=noiseBuffer();filter.type='bandpass';filter.frequency.value=1100+Math.random()*1600;filter.Q.value=1.6;
-    gain.gain.setValueAtTime(.001,now);gain.gain.linearRampToValueAtTime(.11+Math.min(speed/12,1)*.14,now+.002);
-    gain.gain.exponentialRampToValueAtTime(.001,now+.05);
-    source.connect(filter);filter.connect(gain);gain.connect(audioMaster);activeTones.add(source);
-    source.onended=()=>{activeTones.delete(source);source.disconnect();filter.disconnect();gain.disconnect()};
-    source.start(now,Math.random()*.7);source.stop(now+.055);
+    const voice=rollingVoice;
+    if(!soundOn||!voice||!audioCtx||audioCtx.state!=='running'||speed<1.3)return;
+    if(!preview&&(!busy||activeTab!=='prize'||orbMotion<.025))return;
+    const now=audioCtx.currentTime,strength=voice.strength;
+    if(strength<=.025||now<voice.nextContact)return;
+    const rate=1.5+23*Math.pow(strength,1.45);
+    // Random spacing and a speed-dependent average: no fixed-frequency metronome.
+    voice.nextContact=now+Math.max(.026,(.52+Math.random()*1.12)/rate);
+    lastBallContact=now;
+    const buffers=makeContactBuffers(),source=audioCtx.createBufferSource();
+    const filter=audioCtx.createBiquadFilter(),gain=audioCtx.createGain();
+    source.buffer=buffers[Math.floor(Math.random()*buffers.length)];
+    source.playbackRate.value=.84+Math.random()*.3;
+    filter.type='lowpass';filter.frequency.value=1800+Math.random()*750;filter.Q.value=.45;
+    const impact=Math.min(1,speed/12);
+    gain.gain.value=(.09+.18*strength)*(.7+Math.random()*.45)*(.8+.2*impact);
+    source.connect(filter);filter.connect(gain);gain.connect(voice.compressor);
+    voice.impacts.add(source);
+    source.onended=()=>{voice.impacts.delete(source);source.disconnect();filter.disconnect();gain.disconnect()};
+    source.start(now);
 }
 function playBallSound(){tone(950,.19,.18,0,'triangle');tone(640,.25,.16,.18,'triangle')}
 function playWinSound(){[523,659,784,1047].forEach((n,i)=>tone(n,.36,.18,i*.17,'triangle'))}
